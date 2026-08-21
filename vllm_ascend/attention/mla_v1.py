@@ -781,6 +781,22 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.num_heads_padded = 1 << (self.num_heads - 1).bit_length()
         self.head_padding = self.num_heads_padded - self.num_heads
 
+        # HYV4-style MLA has ``qk_nope_head_dim < v_head_dim`` (192 vs 256).
+        # The NPU's ``npu_fused_infer_attention_score`` kernel rejects layouts
+        # where the query's head dim is smaller than the value's head dim. The
+        # existing head-padding path concatenates ``q_nope`` and ``q_pe`` along
+        # the head dim to make ``qk_nope + qk_rope == v_head_dim`` and matches
+        # the kernel's constraint. We force that path on whenever the concat
+        # dimensions align, padding to the next power of 2 (so the kernel
+        # accepts ``num_query_heads``) and slicing the output back to the real
+        # ``num_heads``.
+        if (
+            self.qk_nope_head_dim + self.qk_rope_head_dim == self.v_head_dim
+            and self.head_padding == 0
+        ):
+            self.num_heads_padded = 1 << self.num_heads.bit_length()
+            self.head_padding = self.num_heads_padded - self.num_heads
+
     @staticmethod
     def update_graph_params(
         update_stream,
