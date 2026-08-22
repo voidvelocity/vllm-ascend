@@ -684,11 +684,12 @@ class AscendModelSlimConfig(QuantizationConfig):
 
             is_skipped = None
             for shard_prefix in shard_prefixes:
-                is_shard_skipped = self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                # 关键修复：shard 未出现在描述文件中（layer 0 / shared_experts 等
+                # 未量化层）按 FLOAT 处理，与 else 分支语义保持一致。
+                shard_state = self.quant_description.get(shard_prefix + ".weight", "FLOAT")
+                is_shard_skipped = shard_state == "FLOAT"
                 logger.info("DBG is_layer_skipped_ascend prefix=%s shard=%s v=%s skipped=%s",
-                            prefix, shard_prefix,
-                            self.quant_description.get(shard_prefix + ".weight", "<MISSING>"),
-                            is_shard_skipped)
+                            prefix, shard_prefix, shard_state, is_shard_skipped)
 
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
