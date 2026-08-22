@@ -626,7 +626,8 @@ class BaseDeviceAdaptor:
         block_table: torch.Tensor | None = None,
         sparse_mode: int = 3,
         return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_sink_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if block_table is None:
             block_table = attn_metadata.block_table
         kv = kv_cache[0]
@@ -640,6 +641,9 @@ class BaseDeviceAdaptor:
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         )
+        # ``return_sink_stats`` requires the operator to populate softmax max/sum
+        # tensors, which is the same underlying flag as ``return_lse``.
+        op_return_lse = return_lse or return_sink_stats
         if use_kv_quant_sparse_attention:
             return BaseDeviceAdaptor.execute_kv_quant_sparse_flash_attention(
                 sfa_impl,
@@ -651,7 +655,8 @@ class BaseDeviceAdaptor:
                 actual_seq_lengths_query,
                 actual_seq_lengths_key,
                 sparse_mode=sparse_mode,
-                return_lse=return_lse,
+                return_lse=op_return_lse,
+                return_sink_stats=return_sink_stats,
             )
 
         key_rope = kv_cache[1]
@@ -671,13 +676,15 @@ class BaseDeviceAdaptor:
             layout_kv="PA_BSND",
             sparse_mode=sparse_mode,
             attention_mode=2,
-            return_softmax_lse=return_lse,
+            return_softmax_lse=op_return_lse,
         )
         if not isinstance(result, tuple):
-            if return_lse:
+            if op_return_lse:
                 raise RuntimeError("Sparse flash attention did not return softmax max/sum for DCP LSE merge.")
             return result
         attn_output, softmax_max, softmax_sum = result
+        if return_sink_stats:
+            return attn_output, softmax_max, softmax_sum
         return BaseDeviceAdaptor._format_sparse_flash_attention_output(
             attn_output,
             softmax_max,
@@ -698,7 +705,8 @@ class BaseDeviceAdaptor:
         *,
         sparse_mode: int = 3,
         return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_sink_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
         result = torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention(
             query=query,
@@ -722,10 +730,12 @@ class BaseDeviceAdaptor:
             return_softmax_lse=True,
         )
         if not isinstance(result, tuple):
-            if return_lse:
+            if return_lse or return_sink_stats:
                 raise RuntimeError("C8 sparse flash attention did not return softmax max/sum for DCP LSE merge.")
             return result
         attn_output, softmax_max, softmax_sum = result
+        if return_sink_stats:
+            return attn_output, softmax_max, softmax_sum
         return BaseDeviceAdaptor._format_sparse_flash_attention_output(
             attn_output,
             softmax_max,

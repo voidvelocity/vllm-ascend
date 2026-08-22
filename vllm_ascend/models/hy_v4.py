@@ -185,26 +185,118 @@ def _patch_mla_attention_init_and_forward_for_npu():
         # post-projection tensor of shape ``[N, hidden_size]``.
         # HYV4's ``gated_mla`` post-processing expects the
         # pre-projection tensor ``[N, num_heads * v_head_dim]``,
-        # so it cannot be applied on top of the NPU wrapper's
-        # output. Disable the gate to avoid a shape mismatch.
-        # The linear_gate parameter will be loaded but unused.
+        # so it is applied INSIDE the SFA impl (see
+        # ``gated_mla_linear_gate`` binding below) rather than
+        # after the wrapper.
+        #
+        # The GPU ``HYV4MLAAttention.__init__`` is the only place
+        # that builds ``self.linear_gate`` and
+        # ``self.learnable_sink_param``; we delegate to it but
+        # mask two NPU-incompatible code paths:
+        #   * The sparse-backend probe at the top of the init
+        #     (``get_attn_backend(..., use_sparse=True, ...)``)
+        #     raises ``RuntimeError`` when no NPU sparse backend
+        #     is registered. We temporarily clear the module-level
+        #     ``_SPARSE_LAYER_TYPES`` set so every layer is
+        #     treated as dense; the SFA impl does its own sparse
+        #     dispatch afterwards.
+        #   * ``learnable_sink`` is not touched — its probe is
+        #     already exception-safe.
+        from vllm.models.hy_v4.nvidia import attention as _gpu_attn_mod
+
         config = kwargs.get("config")
         if config is None and len(args) >= 2:
             config = args[1]
-        if config is not None and getattr(config, "gated_mla", False):
-            try:
-                config.gated_mla = False
-            except Exception:
-                pass
-        # Run the original constructor so all MLA submodules
-        # (q_a_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj,
-        # o_proj, rotary_emb, indexer, ...) are populated.
-        original_init(self, *args, **kwargs)
-        # The indexer is disabled upstream (NPU Triton cannot compile
+        # The GPU ``HYV4MLAAttention.__init__`` only creates the
+        # ``Indexer`` (and sets ``self.is_sparse = True``) when
+        # ``layer_types[layer_id] in _SPARSE_LAYER_TYPES`` AND the
+        # probe ``get_attn_backend(..., use_sparse=True, ...)`` returns
+        # a valid backend. On NPU the latter raises (no NPU
+        # ``use_sparse=True`` selector key), so the original code
+        # short-circuited by clearing ``_SPARSE_LAYER_TYPES`` to
+        # ``()`` — that left every layer in dense mode and the
+        # ``Indexer`` was never built, so the NPU had no sparse
+        # attention at all (P0-1 in the precision bug list).
+        #
+        # We now (a) keep the original ``_SPARSE_LAYER_TYPES`` so
+        # ``requested_sparse``/``create_indexer`` are computed
+        # correctly, and (b) monkey-patch ``get_attn_backend`` in the
+        # GPU module to return a sentinel class for the ``use_sparse
+        # =True`` probe so the ``if self.is_sparse: get_attn_backend
+        # (...)`` sanity check does not raise on NPU. The sentinel
+        # class is never instantiated — the NPU path replaces
+        # ``self.mla_attn`` with a ``MultiHeadLatentAttentionWrapper``
+        # anyway.
+        class _SparseBackendSentinel:
+            """Stand-in returned by ``get_attn_backend`` during NPU
+            init so the GPU ``HYV4MLAAttention.__init__`` sparse
+            probe succeeds. Not used at runtime — the NPU replaces
+            ``self.mla_attn`` with its own wrapper.
+
+            The GPU ``MLAAttention.__init__`` calls a few class-level
+            helpers on the backend (``is_mla``, ``get_name``,
+            ``get_impl_cls``); we satisfy those probes and force
+            ``supports_sink()`` to True so the GPU sink-resolution
+            path short-circuits and uses the sentinel directly."""
+
+            @staticmethod
+            def get_name() -> str:
+                return "ASCEND_SFA_SENTINEL"
+
+            @staticmethod
+            def is_mla() -> bool:
+                return True
+
+            @staticmethod
+            def supports_sink() -> bool:
+                return True
+
+            @staticmethod
+            def get_impl_cls():
+                return None
+
+        def _patched_get_attn_backend(*_a, **_kw):
+            return _SparseBackendSentinel
+
+        def _patched_resolve_sink_backend(self, kv_cache_dtype):
+            # On NPU the GPU sink-resolution path is meaningless; the
+            # NPU's SFA impl applies the per-head sink via its own
+            # ``_apply_learnable_sink_rescale`` after the fact.
+            # Returning None keeps the GPU init code path valid
+            # (``enable_sink=False`` -> the sink param is still
+            # created as a buffer, just not fed into the GPU
+            # ``MLAAttention`` impl) so we can read it back in the
+            # NPU wrapper and attach it to the SFA impl.
+            return None
+
+        saved_sparse_layer_types = _gpu_attn_mod._SPARSE_LAYER_TYPES
+        # (a) keep the layer types so requested_sparse evaluates
+        # correctly.
+        # (b) patch get_attn_backend to swallow the probe.
+        # (c) patch _resolve_sink_backend so the GPU sink backend
+        # selection does not try to use the sentinel as a real
+        # backend.
+        saved_get_attn_backend = _gpu_attn_mod.get_attn_backend
+        saved_resolve_sink = HYV4MLAAttention._resolve_sink_backend
+        _gpu_attn_mod.get_attn_backend = _patched_get_attn_backend
+        HYV4MLAAttention._resolve_sink_backend = _patched_resolve_sink_backend
+        try:
+            original_init(self, *args, **kwargs)
+        finally:
+            _gpu_attn_mod.get_attn_backend = saved_get_attn_backend
+            _gpu_attn_mod._SPARSE_LAYER_TYPES = saved_sparse_layer_types
+            HYV4MLAAttention._resolve_sink_backend = saved_resolve_sink
         # ``f8E4M3FN``); the wrapper accepts ``is_sparse=False`` and
         # ``skip_topk=True`` and will simply skip the indexer branch.
-        self.is_sparse = False
-        self.skip_topk = True
+        # NOTE: re-enabled sparse path on NPU. The vllm indexer's
+        # ``per_token_group_quant_fp8`` kernel is bypassed by the
+        # ``IndexerWrapper`` (no-op forward); the NPU's SFA impl
+        # performs the actual top-k selection in
+        # ``indexer_select_post_process`` using the indexer's weights
+        # (``wq_b``, ``wk_weights_proj``, ``k_norm``) and a float32
+        # fallback. The ``is_sparse`` / ``skip_topk`` flags computed
+        # by ``original_init`` are preserved so the SFA impl matches
+        # the GPU's "full" / "shared" indexer layout.
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
@@ -225,10 +317,29 @@ def _patch_mla_attention_init_and_forward_for_npu():
             q_a_layernorm=self.q_a_layernorm,
             q_b_proj=self.q_b_proj,
             q_proj=self.q_proj,
-            indexer=None,
-            indexer_rotary_emb=None,
-            is_sparse=False,
-            topk_indices_buffer=None,
+            # Pass through the vllm indexer for sparse layers; the
+            # ``AscendMultiHeadLatentAttention.__init__`` wraps it in
+            # an ``IndexerWrapper`` so ``indexer(...)`` becomes a
+            # no-op and only the weights (used by the SFA impl's
+            # ``indexer_select_post_process``) survive.
+            indexer=self.indexer if getattr(self, "is_sparse", False) else None,
+            indexer_rotary_emb=self.indexer_rope_emb if getattr(self, "is_sparse", False) else None,
+            is_sparse=bool(getattr(self, "is_sparse", False)),
+            # The vllm ``Indexer`` stores the topk sharing buffer on
+            # itself. Re-expose it on ``MLAModules`` so the SFA impl
+            # can read/write the buffer for ``skip_topk`` layers
+            # (full indexer layers expose it via ``self.indexer``;
+            # shared indexer layers do not build an indexer so we
+            # fall back to the buffer that ``HYV4Model`` created
+            # and threaded through every decoder layer's
+            # ``__init__``).
+            topk_indices_buffer=(
+                self.indexer.topk_indices_buffer
+                if (getattr(self, "is_sparse", False) and self.indexer is not None)
+                else kwargs.get("topk_indices_buffer")
+                if getattr(self, "is_sparse", False)
+                else None
+            ),
         )
         # ``prefix`` is the layer's registered name; the wrapper needs
         # a unique prefix (not the same as the original ``MLAAttention``)
@@ -251,8 +362,67 @@ def _patch_mla_attention_init_and_forward_for_npu():
             cache_config,
             quant_config,
             attn_prefix,
-            skip_topk=True,
+            # Respect the GPU-computed skip_topk flag so "shared"
+            # indexer layers reuse the top-k buffer instead of
+            # recomputing. Sparse "full" layers keep
+            # ``skip_topk=False``; dense layers also have
+            # ``skip_topk=False`` (their indexer is None).
+            skip_topk=bool(getattr(self, "skip_topk", False)),
         )
+        # Bind the per-head learnable attention sink (if any) to the NPU
+        # SFA impl so it can rescale the op's output to match the GPU
+        # ``flash_mla_sparse_fwd`` kernel. The original GPU
+        # ``HYV4MLAAttention.__init__`` created ``learnable_sink_param``
+        # and passed it as ``sinks=...`` to its MLA impl; the NPU wrapper
+        # doesn't accept that kwarg, so we attach it directly to the impl
+        # that the wrapper just instantiated.
+        sink = getattr(self, "learnable_sink_param", None)
+        if sink is not None:
+            inner_impl = getattr(self.mla_attn, "mla_attn", None)
+            inner_impl_impl = getattr(inner_impl, "impl", None) if inner_impl is not None else None
+            if inner_impl_impl is not None:
+                inner_impl_impl.learnable_sink_param = sink
+                # One-shot log so we can confirm the binding actually took
+                # effect at startup. Use the standard vllm logger so the
+                # message lands in the worker log alongside the existing
+                # sink-unavailable warning.
+                from vllm.logger import logger as _vllm_logger
+                _vllm_logger.info_once(
+                    "HYV4 NPU sink bound: dtype=%s shape=%s impl=%s",
+                    sink.dtype,
+                    tuple(sink.shape),
+                    type(inner_impl_impl).__name__,
+                )
+            else:
+                from vllm.logger import logger as _vllm_logger
+                _vllm_logger.warning_once(
+                    "HYV4 NPU sink present but inner SFA impl not found; "
+                    "learnable_sink will be ignored. layer=%s",
+                    self.prefix,
+                )
+
+        # Bind the gated_mla linear_gate to the SFA impl so it can apply
+        # ``sigmoid(linear_gate(hidden_states))`` to the pre-o_proj
+        # attention output (matching the GPU
+        # ``HYV4MLAAttention._indexer_and_attn`` post-processing). The
+        # gate is constructed in the GPU ``__init__`` (when
+        # ``config.gated_mla=True``) but the NPU wrapper discards the
+        # kwarg, so we attach it directly here.
+        gate = getattr(self, "linear_gate", None)
+        if gate is not None:
+            inner_impl = getattr(self.mla_attn, "mla_attn", None)
+            inner_impl_impl = getattr(inner_impl, "impl", None) if inner_impl is not None else None
+            if inner_impl_impl is not None:
+                inner_impl_impl.gated_mla_linear_gate = gate
+                inner_impl_impl.gated_mla_gating_type = getattr(
+                    self.config, "gating_type", "headwise"
+                )
+                from vllm.logger import logger as _vllm_logger
+                _vllm_logger.info_once(
+                    "HYV4 NPU gated_mla bound: gating_type=%s impl=%s",
+                    inner_impl_impl.gated_mla_gating_type,
+                    type(inner_impl_impl).__name__,
+                )
 
     def _npu_forward(self, positions, hidden_states, llama_4_scaling=None):  # type: ignore[no-redef]
         # Delegate MLA + o_proj to the NPU's
@@ -260,14 +430,11 @@ def _patch_mla_attention_init_and_forward_for_npu():
         # ``MultiHeadLatentAttentionWrapper`` PluggableLayer). The
         # wrapper's impl bakes ``o_proj`` into its forward and
         # returns the post-projection tensor of shape
-        # ``[N, hidden_size]``.
-        attn_out = self.mla_attn(positions, hidden_states, llama_4_scaling)
-        # HYV4's ``gated_mla`` post-processing cannot be applied
-        # here because the gate expects the pre-projection tensor
-        # ``[N, num_heads * v_head_dim]``. We disabled
-        # ``gated_mla`` in ``_npu_init`` so the gate is a no-op
-        # in practice (its weights are still loaded, just unused).
-        return attn_out
+        # ``[N, hidden_size]``. ``gated_mla`` and ``learnable_sink``
+        # are both applied INSIDE the SFA impl between attention
+        # and o_proj, so this wrapper-level forward stays a
+        # straight pass-through.
+        return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
     HYV4MLAAttention.__init__ = _npu_init
     HYV4MLAAttention.forward = _npu_forward
@@ -287,65 +454,19 @@ _patch_mla_attention_init_and_forward_for_npu()
 
 
 def _disable_hyv4_indexer_for_npu():
-    """Disable the NVIDIA lightning indexer on NPU.
+    """DEPRECATED: kept as a no-op for backward compatibility.
 
-    The NVIDIA ``Indexer`` kernel (``per_token_group_quant_fp8``) cannot be
-    compiled by Ascend's Triton backend because ``f8E4M3FN`` is not
-    recognized by the BiShengIR pipeline. The NPU's SFA / DSA backend
-    already consumes ``topk_indices_buffer`` directly, so the
-    ``self.indexer`` path is unnecessary. Force every layer into
-    ``skip_topk=True`` so the indexer's forward is short-circuited and its
-    submodules are never built.
+    The NPU's SFA impl now runs the top-k selection in
+    ``indexer_select_post_process`` (using the vllm ``Indexer``'s
+    weights as a parameter holder and a float32 fallback for the
+    FP8 quant kernel), and ``_npu_init`` preserves the
+    ``is_sparse`` / ``skip_topk`` flags computed by
+    ``original_init``. The NVIDIA indexer's ``forward`` is wrapped
+    by ``IndexerWrapper`` (no-op), so no FP8 Triton kernel is
+    actually invoked on the NPU path. This function used to force
+    every layer into dense attention; that is no longer needed.
     """
-    from vllm.models.hy_v4.nvidia.attention import HYV4MLAAttention
-
-    # Patch ``create_indexer``-style logic by overriding the class attribute
-    # logic. The constructor reads ``index_topk`` and ``layer_types`` to
-    # decide. We monkey-patch the class to always report dense attention.
-    original_init = HYV4MLAAttention.__init__
-
-    # Force ``requested_sparse`` to False before the indexer branch is
-    # evaluated. The constructor calls ``getattr(config, "index_topk")``
-    # indirectly through ``layer_types`` membership checks; the cleanest
-    # hook is to drop the layer_types override after init.
-    def patched_init(self, *args, **kwargs):  # type: ignore[no-redef]
-        # Force every layer to take the dense branch so the constructor
-        # never builds the NVIDIA ``Indexer`` submodule (its
-        # ``per_token_group_quant_fp8`` Triton kernel fails to compile on
-        # Ascend because ``f8E4M3FN`` is not supported). The NPU's SFA
-        # backend consumes ``topk_indices_buffer`` directly and does not
-        # need this indexer.
-        config = kwargs.get("config")
-        if config is None and len(args) >= 2:
-            config = args[1]
-        if config is not None:
-            if getattr(config, "index_topk", None) is not None:
-                try:
-                    delattr(config, "index_topk")
-                except Exception:
-                    try:
-                        config.index_topk = None
-                    except Exception:
-                        pass
-            layer_types = getattr(config, "layer_types", None)
-            if layer_types is not None:
-                try:
-                    config.layer_types = ["full"] * len(layer_types)
-                except Exception:
-                    pass
-        original_init(self, *args, **kwargs)
-        # Belt-and-braces: if anything still references a (now-invalid)
-        # indexer, drop it so no submodule leaks into the module hierarchy.
-        if getattr(self, "indexer", None) is not None:
-            self.indexer = None
-        if getattr(self, "indexer_rope_emb", None) is not None:
-            self.indexer_rope_emb = None
-        self.is_sparse = False
-        self.skip_topk = True
-        if hasattr(self, "topk_indices_buffer"):
-            self.topk_indices_buffer = None
-
-    HYV4MLAAttention.__init__ = patched_init
+    return
 
 
 _disable_hyv4_indexer_for_npu()
