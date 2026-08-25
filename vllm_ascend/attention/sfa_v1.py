@@ -662,10 +662,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.k_norm = None
         self.cp_size = 1
         self.is_rope_neox_style = True
+        # HYV4's indexer checkpoint (PTM layout) stores q_pe/k_pe in the LAST
+        # rope_dim dims of the index head and applies interleaved RoPE
+        # (is_neox_style=False), exactly like its main attention path. See the
+        # GPU reference: vllm/models/hy_v4/nvidia/attention.py
+        # (Indexer.prepare_inputs). DSV3.2 (head_dim == rope_dim) and GLM keep
+        # the legacy first-dims convention.
+        self.indexer_pe_last = False
         self.use_torch_npu_lightning_indexer = False
         if self.vllm_config.model_config.hf_config.model_type in ["glm_moe_dsa"]:
             self.is_rope_neox_style = False
             self.use_torch_npu_lightning_indexer = True
+        elif self.vllm_config.model_config.hf_config.model_type in ["hy_v4"]:
+            self.is_rope_neox_style = False
+            self.indexer_pe_last = True
 
         # Sparse C8 has two independent meanings in SFA:
         # - SFA packed KV cache for npu_kv_quant_sparse_flash_attention.
@@ -1395,22 +1405,44 @@ class AscendSFAImpl(MLAAttentionImpl):
         if HAS_TRITON:
             cos = cos.view(-1, self.qk_rope_head_dim)
             sin = sin.view(-1, self.qk_rope_head_dim)
-            k_li = rope_forward_triton_siso(
-                k_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
+            if self.indexer_pe_last:
+                # HYV4: rope only the LAST rope_dim dims (pe) and keep the
+                # checkpoint's [nope, pe] physical layout so the K cache
+                # matches the GPU reference.
+                k_li_nope, k_li_pe = torch.split(
+                    k_li, [self.head_dim - self.qk_rope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+                k_li_pe = rope_forward_triton_siso(
+                    k_li_pe, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
+                )
+                k_li = torch.cat([k_li_nope, k_li_pe], dim=-1)
+            else:
+                k_li = rope_forward_triton_siso(
+                    k_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
+                )
         else:
-            k_li_pe, k_li_nope = torch.split(
-                k_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )
+            if self.indexer_pe_last:
+                k_li_nope, k_li_pe = torch.split(
+                    k_li, [self.head_dim - self.qk_rope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+            else:
+                k_li_pe, k_li_nope = torch.split(
+                    k_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
+                )
 
             cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
             sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
 
-            k_li_pe = k_li_pe.unsqueeze(2)
-            k_li_pe = torch_npu.npu_rotary_mul(k_li_pe, cos, sin)
-            k_li_pe = k_li_pe.squeeze(2)
+            if self.is_rope_neox_style:
+                k_li_pe = k_li_pe.unsqueeze(2)
+                k_li_pe = torch_npu.npu_rotary_mul(k_li_pe, cos, sin)
+                k_li_pe = k_li_pe.squeeze(2)
+            else:
+                # Interleaved RoPE via the same op used by the main
+                # attention path (rope_single -> npu_interleave_rope).
+                k_li_pe = self.rope_single(k_li_pe, cos, sin)
 
-            k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)  # [b*s,128]
+            k_li = torch.cat([k_li_nope, k_li_pe], dim=-1)  # [b*s,128]
 
         if self.use_sparse_c8_indexer:
             k_li = k_li @ AscendSFAImpl.k_hadamard
@@ -1471,18 +1503,40 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, _ = self.wq_b(q_c)
         q_li = q_li.view(-1, self.n_head, self.head_dim)
         if HAS_TRITON:
-            q_li = rope_forward_triton_siso(
-                q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
+            if self.indexer_pe_last:
+                # HYV4: rope only the LAST rope_dim dims (pe) and keep the
+                # checkpoint's [nope, pe] physical layout so it matches the
+                # roped K cache layout.
+                q_li_nope, q_li_pe = torch.split(
+                    q_li, [self.head_dim - self.qk_rope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+                q_li_pe = rope_forward_triton_siso(
+                    q_li_pe, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
+                )
+                q_li = torch.cat([q_li_nope, q_li_pe], dim=-1)
+            else:
+                q_li = rope_forward_triton_siso(
+                    q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
+                )
         else:
-            q_li_pe, q_li_nope = torch.split(
-                q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )
+            if self.indexer_pe_last:
+                q_li_nope, q_li_pe = torch.split(
+                    q_li, [self.head_dim - self.qk_rope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+            else:
+                q_li_pe, q_li_nope = torch.split(
+                    q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
+                )
 
-            q_li_pe = q_li_pe.unsqueeze(2)
-            q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
-            q_li_pe = q_li_pe.squeeze(2)
-            q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)
+            if self.is_rope_neox_style:
+                q_li_pe = q_li_pe.unsqueeze(2)
+                q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
+                q_li_pe = q_li_pe.squeeze(2)
+            else:
+                # Interleaved RoPE via the same op used by the main
+                # attention path (rope_single -> npu_interleave_rope).
+                q_li_pe = self.rope_single(q_li_pe, cos, sin)
+            q_li = torch.cat([q_li_nope, q_li_pe], dim=-1)
 
         q_li_scale = None
         q_li_shape_ori = None
