@@ -13,9 +13,29 @@ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
 def copy_snapshot_to_gpu(buffer: CpuGpuBuffer) -> torch.Tensor:
-    """Copy a pinned snapshot of a CPU buffer to its GPU buffer."""
-    cpu_snapshot = buffer.cpu.clone().pin_memory()
-    return buffer.gpu.copy_(cpu_snapshot, non_blocking=True)
+    """Copy the CPU buffer to its GPU counterpart.
+
+    ``CpuGpuBuffer.cpu`` is already pinned, so the standard
+    ``buffer.copy_to_gpu()`` does an async H2D transfer directly from
+    pinned memory with no extra ``mlock`` allocation. This is the same
+    call vllm-core's GPU model runner uses (see
+    ``vllm/v1/worker/gpu_model_runner.py:1990,5799``).
+
+    The previous implementation cached a separate ``_pinned_snapshot``
+    buffer that was re-used across calls. That re-use races with the
+    async H2D copy: the next call's ``snap.copy_(buffer.cpu)`` would
+    overwrite the snap while the previous H2D DMA was still reading
+    it, causing ``query_start_loc`` / ``gdn_query_start_loc`` on the
+    GPU to contain the *next* batch's values, which corrupts the
+    current forward pass and produces garbled output (``verbalGB
+    textbooks...`` style noise). It also doubled the resident pinned
+    memory footprint, which made the original
+    ``aclrtMallocHost (207001)`` OOM easier to hit under cudagraph
+    capture.
+    """
+    # region fix cudagraph-host-oom
+    return buffer.copy_to_gpu()
+    # endregion fix cudagraph-host-oom
 
 
 @triton.jit

@@ -123,10 +123,22 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
 
 
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
+    # region fix mtp-inference-context-var
+    # ``update_full_graph_params`` (called during inference) invokes
+    # ``attn_backend.get_impl_cls()`` which routes here.  However, the
+    # vLLM config context has already been torn down (only set during
+    # ``load_model``) by the time inference runs, so calling
+    # ``get_current_vllm_config()`` raises AssertionError.  Fall back
+    # to the ``_or_none`` variant — when no config is set, DCP indexer
+    # cannot be enabled anyway, and callers can choose the default
+    # (non-DCP) impl.
     if vllm_config is None:
-        from vllm.config import get_current_vllm_config
+        from vllm.config import get_current_vllm_config_or_none
 
-        vllm_config = get_current_vllm_config()
+        vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return False
+    # endregion fix mtp-inference-context-var
 
     parallel_config = vllm_config.parallel_config
     return (

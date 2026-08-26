@@ -704,6 +704,18 @@ class AscendModelSlimConfig(QuantizationConfig):
                 key.startswith(prefix) and key.endswith(".weight") and value == "FLOAT"
                 for key, value in self.quant_description.items()
             )
+            # region fix mtp-layer-quant
+            # MTP draft layers (e.g. model.layers.78.* for hy_v4 with n_predict=1)
+            # are stored under the `model.mtp_layers.*` namespace in the
+            # checkpoint, so the runtime prefix `model.layers.<idx>.*` does not
+            # match any key in `quant_description`. Treat such unknown layers
+            # as unquantized (FLOAT) instead of letting the lookup in
+            # `get_linear_quant_type` raise `KeyError`.
+            if not is_skipped and not any(
+                key.startswith(prefix) for key in self.quant_description
+            ):
+                is_skipped = True
+            # endregion fix mtp-layer-quant
 
         assert is_skipped is not None
         return is_skipped

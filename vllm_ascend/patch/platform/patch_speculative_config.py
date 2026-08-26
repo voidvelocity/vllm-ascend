@@ -131,6 +131,47 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
     if initial_architecture == "MistralLarge3ForCausalLM":
         hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
 
+    if hf_config.model_type == "hy_v3":
+        hf_config.model_type = "hy_v3_mtp"
+        n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+        hf_config.update(
+            {"n_predict": n_predict, "architectures": ["HYV3MTPModel"]}
+        )
+
+    if hf_config.model_type == "hy_v4":
+        hf_config.model_type = "hy_v4_mtp"
+        n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+        hf_config.update(
+            {"n_predict": n_predict, "architectures": ["HYV4MTPModel"]}
+        )
+
+    if "exaone4_5" in hf_config.model_type:
+        hf_config.model_type = "exaone4_5_mtp"
+    if hf_config.model_type == "exaone4_5_mtp":
+        n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+        hf_config.update(
+            {"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]}
+        )
+
+    if hf_config.model_type == "intern_s2_preview":
+        text_config = getattr(hf_config, "text_config", None)
+        is_moe = getattr(text_config, "model_type", None) == "qwen3_5_moe_text"
+        hf_config.model_type = "qwen3_5_mtp"
+        n_predict = getattr(text_config, "mtp_num_hidden_layers", None)
+        hf_config.update(
+            {
+                "n_predict": n_predict,
+                "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
+            }
+        )
+
+    if hf_config.model_type in ("gemma4_assistant", "gemma4_unified_assistant"):
+        hf_config.model_type = "gemma4_mtp"
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if hasattr(text_config, "num_kv_shared_layers"):
+            text_config.num_kv_shared_layers = 0
+        hf_config.update({"n_predict": 1, "architectures": ["Gemma4MTPModel"]})
+
     return hf_config
 
 
