@@ -605,11 +605,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.skip_topk = kwargs.get("skip_topk", False)
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
         self.layer_name = kwargs.get("layer_name")
-        from vllm.logger import logger as _vllm_logger_init
-        _vllm_logger_init.info(
-            "HYV4 NPU SFA IMPL init: layer=%s indexer=%s topk_buf=%s skip_topk=%s",
-            self.layer_name, kwargs.get("indexer"), self.topk_indices_buffer, self.skip_topk,
-        )
 
         ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
