@@ -796,7 +796,39 @@ class KVCacheRecvingThread(threading.Thread):
             first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
             if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
                 end_layer_index += self.num_draft_layers
-            return [layer_idx for layer_idx in layer_indices if first_layer_index <= layer_idx < end_layer_index]
+
+            def _in_pp_range(layer_idx: int) -> bool:
+                if first_layer_index <= layer_idx < end_layer_index:
+                    return True
+                # Models with two registered attention modules per layer
+                # (e.g. Hy4: the bypassed legacy ``.attn`` plus the live NPU
+                # ``.npu_attn.attn`` wrapper) have the second entry remapped
+                # to ``[num_layers, 2 * num_layers)`` by
+                # ``_build_kv_group2layeridx``. Those entries hold the live
+                # KV cache of their physical layer, so they must follow the
+                # physical layer into the same PP rank instead of being
+                # dropped by the filter below.
+                return (
+                    layer_idx >= self.num_layers
+                    and first_layer_index <= layer_idx - self.num_layers < end_layer_index
+                )
+
+            kept = [layer_idx for layer_idx in layer_indices if _in_pp_range(layer_idx)]
+            num_remapped_kept = sum(1 for layer_idx in kept if layer_idx >= self.num_layers)
+            if num_remapped_kept and not getattr(self, "_pd_diag_pp_filter_logged", False):
+                self._pd_diag_pp_filter_logged = True
+                logger.info(
+                    "[PD-DIAG] pp_layer_indices rank=%s range=[%s,%s) kept=%d/%d layers, "
+                    "including %d dual-attn remapped layer indices (>= num_layers=%d)",
+                    prefill_pp_rank,
+                    first_layer_index,
+                    end_layer_index,
+                    len(kept),
+                    len(layer_indices),
+                    num_remapped_kept,
+                    self.num_layers,
+                )
+            return kept
 
         for group_pull in group_pulls:
             group_idx = group_pull.group_id
@@ -2336,6 +2368,65 @@ class MooncakeConnectorWorker:
 
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+
+        # --- PD-precision diagnostic dump (one-shot, INFO level) ---
+        # Reveals: per-layer entry count (GPU .attn + NPU .npu_attn dual entries),
+        # MTP-range remapping, transfer-group splitting within one manager group
+        # (which would hit the local_block_ids overwrite in _get_kv_split_metadata),
+        # per-layer tensor counts and block_size_scale (dsa_k mismatch).
+        try:
+            from vllm.v1.worker.utils import extract_layer_index as _eli
+
+            _num_attn_mod = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
+            _raw_idx: dict[int, list[str]] = {}
+            for _name in kv_caches:
+                _raw_idx.setdefault(_eli(_name, _num_attn_mod), []).append(_name)
+            _dup_idx = {k: v for k, v in _raw_idx.items() if len(v) > 1}
+            _mgr_split: dict[int, list[int]] = {}
+            for _gid, (_gspec, _lidx) in self.kv_group2layeridx.items():
+                _mgr_split.setdefault(_gspec.get("kv_cache_group_id", _gid), []).append(_gid)
+            _multi_transfer = {k: v for k, v in _mgr_split.items() if len(v) > 1}
+            _tensor_counts: dict[int, int] = {
+                i: len(a) for i, a in enumerate(self.kv_caches_base_addr) if a
+            }
+            _scale_rows = {i: s for i, s in enumerate(self.block_size_scale) if s}
+            _anomalous_scale = {i: s for i, s in _scale_rows.items() if any(x != 1 for x in s)}
+            logger.info(
+                "[PD-DIAG] kv_caches entries=%d unique_layer_idx=%d num_blocks=%d block_size=%d "
+                "raw_dup_layer_idx_count=%d dup_sample=%s",
+                len(kv_caches),
+                len(_tensor_counts),
+                self.num_blocks,
+                self.block_size,
+                len(_dup_idx),
+                dict(list(_dup_idx.items())[:3]),
+            )
+            logger.info(
+                "[PD-DIAG] per_layer_tensor_counts=%s", _tensor_counts
+            )
+            logger.info(
+                "[PD-DIAG] block_size_scale_all=%s anomalous(non-1)=%s", _scale_rows, _anomalous_scale
+            )
+            logger.info(
+                "[PD-DIAG] manager_group->transfer_groups=%s multi_transfer_groups=%s",
+                _mgr_split,
+                _multi_transfer,
+            )
+            for _gid, (_gspec, _lidx) in sorted(self.kv_group2layeridx.items()):
+                logger.info(
+                    "[PD-DIAG] transfer_group=%d mgr=%d n_layers=%d layers_head=%s layers_tail=%s "
+                    "spec=%s names_head=%s",
+                    _gid,
+                    _gspec.get("kv_cache_group_id", _gid),
+                    len(_lidx),
+                    _lidx[:6],
+                    _lidx[-3:],
+                    _gspec.get("kv_cache_spec_type"),
+                    _gspec["layer_names"][:3],
+                )
+        except Exception:
+            logger.exception("[PD-DIAG] dump failed")
+        # --- end PD-precision diagnostic dump ---
 
         logger.debug(
             "Mooncake register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
