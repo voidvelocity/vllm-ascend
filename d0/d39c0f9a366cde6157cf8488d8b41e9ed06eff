@@ -1,0 +1,14 @@
+docs/source/tutorials/models/Hy4-preview.md
+  h_9f58e71e47ba00 1-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "d0d39c0f9a366cde6157cf8488d8b41e9ed06eff",
+  "prompts": {},
+  "humans": {
+    "h_9f58e71e47ba00": {
+      "author": "voidvelocity <1225714785@qq.com>"
+    }
+  }
+}
