@@ -748,6 +748,11 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
+        # Required by the _filter_layers_by_pp_range closure below; the
+        # sibling MooncakeConnectorWorker._build_kv_group2layeridx imports it
+        # locally, which does not cover this method's scope.
+        from vllm.v1.worker.utils import extract_layer_index
+
         remote_request_id = req_meta["remote_request_id"]
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
@@ -792,41 +797,40 @@ class KVCacheRecvingThread(threading.Thread):
                 local_block_ids_replicate_k[0],
             )
 
-        def pp_layer_indices(layer_indices: list[int], prefill_pp_rank: int) -> list[int]:
+        def _filter_layers_by_pp_range(
+            layer_indices: list[int], layer_names: list[str], prefill_pp_rank: int
+        ) -> list[int]:
+            """Keep only entries whose *physical* layer belongs to the prefill
+            producer's PP stage. Filtering is based on the physical layer
+            index parsed from the layer name (not the global transfer index),
+            so the dead (.attn) and live (.npu_attn.attn) entries of the same
+            physical layer are kept or dropped together, and draft (MTP)
+            entries are only kept for the last PP rank.
+            """
             first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
             if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
                 end_layer_index += self.num_draft_layers
 
-            def _in_pp_range(layer_idx: int) -> bool:
-                if first_layer_index <= layer_idx < end_layer_index:
-                    return True
-                # Models with two registered attention modules per layer
-                # (e.g. Hy4: the bypassed legacy ``.attn`` plus the live NPU
-                # ``.npu_attn.attn`` wrapper) have the second entry remapped
-                # to ``[num_layers, 2 * num_layers)`` by
-                # ``_build_kv_group2layeridx``. Those entries hold the live
-                # KV cache of their physical layer, so they must follow the
-                # physical layer into the same PP rank instead of being
-                # dropped by the filter below.
-                return (
-                    layer_idx >= self.num_layers
-                    and first_layer_index <= layer_idx - self.num_layers < end_layer_index
-                )
+            def _in_pp_range(layer_name: str) -> bool:
+                phys_layer_idx = extract_layer_index(layer_name, 1)
+                return first_layer_index <= phys_layer_idx < end_layer_index
 
-            kept = [layer_idx for layer_idx in layer_indices if _in_pp_range(layer_idx)]
-            num_remapped_kept = sum(1 for layer_idx in kept if layer_idx >= self.num_layers)
-            if num_remapped_kept and not getattr(self, "_pd_diag_pp_filter_logged", False):
+            kept = [
+                layer_idx
+                for layer_idx, layer_name in zip(layer_indices, layer_names)
+                if _in_pp_range(layer_name)
+            ]
+            if kept and not getattr(self, "_pd_diag_pp_filter_logged", False):
                 self._pd_diag_pp_filter_logged = True
                 logger.info(
-                    "[PD-DIAG] pp_layer_indices rank=%s range=[%s,%s) kept=%d/%d layers, "
-                    "including %d dual-attn remapped layer indices (>= num_layers=%d)",
+                    "[PD-DIAG] _filter_layers_by_pp_range rank=%s phys_range=[%s,%s) "
+                    "kept=%d/%d entries head=%s",
                     prefill_pp_rank,
                     first_layer_index,
                     end_layer_index,
                     len(kept),
                     len(layer_indices),
-                    num_remapped_kept,
-                    self.num_layers,
+                    kept[:6],
                 )
             return kept
 
@@ -834,7 +838,9 @@ class KVCacheRecvingThread(threading.Thread):
             group_idx = group_pull.group_id
             group_spec, layer_indices = self.kv_group2layeridx[group_idx]
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
-            layer_indices = pp_layer_indices(layer_indices, group_pull.prefill_pp_rank)
+            layer_indices = _filter_layers_by_pp_range(
+                layer_indices, group_spec["layer_names"], group_pull.prefill_pp_rank
+            )
             if not layer_indices:
                 continue
             tp_num_need_pulls = group_pull.num_group_pulls
@@ -2156,27 +2162,40 @@ class MooncakeConnectorWorker:
 
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] = {}
         num_attn_module = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
-        next_mtp_layer_idx = self.total_layers
         transfer_group_id = 0
         for kv_cache_group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
             layer_entries: list[tuple[str, int]] = []
-            # For eagle3 method there is no "mtp" in layer names, and upstream model initiation assigns the layer id
-            # that is sliced by Pipeline Parallel. So the eagle layer id will confilt with target model layers.
-            # Here we determine whether the current layer is an eagle layer based on whether the layer id has been
-            # assigned to previous layers. If the layer id has been assigned, we treat the current layer as
-            # an eagle layer and assign a new layer id starting from total_layers.
-            assigned_indices: set[int] = set()
+            # Deterministic global KV index (required for PD disaggregation
+            # with pipeline parallelism): the index must be a pure function
+            # of the layer name so that the prefill producer (PP-sharded,
+            # only stage-local layer names) and the decode consumer (full
+            # model) build identical index tables. The previous eagle-style
+            # conflict remapping numbered entries in local iteration order,
+            # so a PP stage produced different indices than the full model
+            # and the consumer hit IndexError when indexing the producer's
+            # per-layer base address table.
+            # Layout (Hy4 registers a legacy ".attn" dead pool plus the live
+            # ".npu_attn.attn" wrapper for each physical layer):
+            #   main dead pool : [0, total_layers)
+            #   main live pool : phys_idx + total_layers
+            #   draft pools    : 2 * total_layers + 2 * draft_pos (+1 live)
             for layer_name in group_spec.layer_names:
+                phys_layer_idx = extract_layer_index(layer_name, num_attn_module)
+                is_live_entry = ".npu_attn." in layer_name
                 if "mtp" in layer_name:
-                    layer_idx = next_mtp_layer_idx
-                    next_mtp_layer_idx += 1
+                    draft_pos = phys_layer_idx
+                elif phys_layer_idx >= self.total_layers:
+                    draft_pos = phys_layer_idx - self.total_layers
                 else:
-                    layer_idx = extract_layer_index(layer_name, num_attn_module)
-                    if assigned_indices and layer_idx < min(assigned_indices) or layer_idx in assigned_indices:
-                        layer_idx = next_mtp_layer_idx
-                        next_mtp_layer_idx += 1
-                assigned_indices.add(layer_idx)
+                    draft_pos = None
+                if draft_pos is None:
+                    layer_idx = phys_layer_idx + self.total_layers if is_live_entry else phys_layer_idx
+                else:
+                    layer_idx = 2 * self.total_layers + 2 * draft_pos + (1 if is_live_entry else 0)
                 layer_entries.append((layer_name, layer_idx))
+            assert len({idx for _, idx in layer_entries}) == len(layer_entries), (
+                f"KV layer index collision in group {kv_cache_group_id}: {layer_entries}"
+            )
 
             spec_groups: OrderedDict[
                 tuple[str, int | None, int | None],
