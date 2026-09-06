@@ -241,6 +241,17 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
+# LoRA per-step routing: requests scheduling at most this many tokens are
+# considered decode-sized (decode=1, MTP verify=num_draft+1); batches made
+# entirely of such requests run the AscendC sgmv/bgmv kernels. Batches with
+# any larger (prefill) request use the masked-GEMM fast path.
+_LORA_SMALL_BATCH_MAX_SCHED_TOKENS = 8
+
+# Debug counters for LoRA kernel routing (see _route_lora_kernels); logged
+# periodically so the kernel/matmul split of real steps can be observed.
+_LORA_ROUTE_STATS = {"calls": 0, "kernel": 0, "matmul": 0, "last_log": 0.0}
+_LORA_ROUTE_LOG_INTERVAL_S = 30.0
+
 
 @dataclass
 class GraphCaptureContext:
@@ -1555,6 +1566,86 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
             total_num_scheduled_tokens,
         )
+
+    def _route_lora_kernels(self, num_scheduled_tokens: np.ndarray, force_kernel: bool = False) -> None:
+        """
+        Per-step LoRA routing: batches where every request schedules only a
+        few tokens (decode / MTP verify) run the AscendC sgmv/bgmv kernels,
+        which beat Cube-based matmul at small batch sizes; batches that
+        contain a prefill chunk use the masked-GEMM fast path. The flag is
+        read at execution time by the lora_linear custom op body
+        (PunicaWrapperNPU.add_lora_linear dispatches through it, so the
+        choice is not constant-folded into the compiled artifact).
+
+        Dummy runs (compile warmup / ACL graph capture) must always pass
+        force_kernel=True: during capture the live flag decides which path is
+        recorded into the replayed decode graphs, and the AscendC kernel
+        path is the faster choice for the decode-heavy workload.
+        """
+        if self.lora_config is None:
+            return
+        if force_kernel:
+            kernel_only = True
+        else:
+            # A decode request schedules 1 token (or num_draft+1 with MTP);
+            # a prefill request schedules its prompt length.
+            kernel_only = num_scheduled_tokens.size == 0 or bool(
+                np.max(num_scheduled_tokens) <= _LORA_SMALL_BATCH_MAX_SCHED_TOKENS
+            )
+        n_wrappers = 0
+        try:
+            adapters = self.lora_manager._adapter_manager
+            for wrapper in adapters.punica_wrapper_mapping.values():
+                if hasattr(wrapper, "_kernel_only_small_batch"):
+                    wrapper._kernel_only_small_batch = kernel_only
+                    n_wrappers += 1
+        except AttributeError:
+            logger.warning_once(
+                "LoRA route: failed to reach punica wrappers via "
+                "lora_manager._adapter_manager.punica_wrapper_mapping"
+            )
+            return
+        # Periodic debug log: observe the kernel/matmul split of real steps.
+        # It also reports the punica custom-op path counters, because the
+        # logger inside the custom op body never emits records (the op body
+        # executes inside compiled/captured graphs where log records from
+        # that module are dropped), while this logger is known to work.
+        stats = _LORA_ROUTE_STATS
+        stats["calls"] += 1
+        stats["kernel" if kernel_only else "matmul"] += 1
+        now = time.monotonic()
+        if now - stats["last_log"] >= _LORA_ROUTE_LOG_INTERVAL_S:
+            stats["last_log"] = now
+            try:
+                from vllm_ascend.lora.punica_npu import _LORA_PATH_STATS
+
+                op_calls = _LORA_PATH_STATS["calls"]
+                op_kernel = _LORA_PATH_STATS["kernel"]
+                op_matmul = _LORA_PATH_STATS["matmul"]
+            except Exception:
+                op_calls = op_kernel = op_matmul = -1
+            logger.info(
+                "LoRA route: calls=%d kernel=%d matmul=%d wrappers=%d "
+                "(force_kernel=%s, kernel_only=%s, max_sched_tokens=%s) "
+                "op: calls=%d kernel=%d matmul=%d",
+                stats["calls"], stats["kernel"], stats["matmul"], n_wrappers,
+                force_kernel, kernel_only,
+                int(np.max(num_scheduled_tokens)) if num_scheduled_tokens.size else 0,
+                op_calls, op_kernel, op_matmul,
+            )
+
+    def set_active_loras(
+        self,
+        input_batch,
+        num_scheduled_tokens: np.ndarray,
+        num_sampled_tokens: np.ndarray | None = None,
+        mapping_type=None,
+    ) -> None:
+        self._route_lora_kernels(num_scheduled_tokens)
+        if mapping_type is None:
+            super().set_active_loras(input_batch, num_scheduled_tokens, num_sampled_tokens)
+        else:
+            super().set_active_loras(input_batch, num_scheduled_tokens, num_sampled_tokens, mapping_type)
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
@@ -3769,6 +3860,18 @@ class NPUModelRunner(GPUModelRunner):
             # which is introduced by vllm-project/vllm#32005
             num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
         ):
+            # Route dummy runs with the same rule as real steps, except that
+            # dummy batches (compile warmup / graph capture) ALWAYS bake in
+            # the AscendC kernel path: torch.compile traces this forward with
+            # evaluate_guards=False, so the branch in
+            # PunicaWrapperNPU._apply_single_lora_linear is constant-folded
+            # from whatever the flag holds at trace time. The compile warmup
+            # runs a large (e.g. 64-token) dummy batch that would route to the
+            # masked-GEMM path and permanently bake matmul into every
+            # execution path (prefill AND replayed decode graphs). Kernels win
+            # end-to-end (58ms vs 67ms per decode chunk, wall 149s vs 155s
+            # measured on qwen3.5-27B TP4 in16/c4), so trace them in here.
+            self._route_lora_kernels(num_scheduled_tokens, force_kernel=True)
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
             if (
