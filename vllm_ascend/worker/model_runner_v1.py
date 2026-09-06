@@ -247,11 +247,6 @@ SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 # any larger (prefill) request use the masked-GEMM fast path.
 _LORA_SMALL_BATCH_MAX_SCHED_TOKENS = 8
 
-# Debug counters for LoRA kernel routing (see _route_lora_kernels); logged
-# periodically so the kernel/matmul split of real steps can be observed.
-_LORA_ROUTE_STATS = {"calls": 0, "kernel": 0, "matmul": 0, "last_log": 0.0}
-_LORA_ROUTE_LOG_INTERVAL_S = 30.0
-
 
 @dataclass
 class GraphCaptureContext:
@@ -1592,46 +1587,15 @@ class NPUModelRunner(GPUModelRunner):
             kernel_only = num_scheduled_tokens.size == 0 or bool(
                 np.max(num_scheduled_tokens) <= _LORA_SMALL_BATCH_MAX_SCHED_TOKENS
             )
-        n_wrappers = 0
         try:
             adapters = self.lora_manager._adapter_manager
             for wrapper in adapters.punica_wrapper_mapping.values():
                 if hasattr(wrapper, "_kernel_only_small_batch"):
                     wrapper._kernel_only_small_batch = kernel_only
-                    n_wrappers += 1
         except AttributeError:
             logger.warning_once(
                 "LoRA route: failed to reach punica wrappers via "
                 "lora_manager._adapter_manager.punica_wrapper_mapping"
-            )
-            return
-        # Periodic debug log: observe the kernel/matmul split of real steps.
-        # It also reports the punica custom-op path counters, because the
-        # logger inside the custom op body never emits records (the op body
-        # executes inside compiled/captured graphs where log records from
-        # that module are dropped), while this logger is known to work.
-        stats = _LORA_ROUTE_STATS
-        stats["calls"] += 1
-        stats["kernel" if kernel_only else "matmul"] += 1
-        now = time.monotonic()
-        if now - stats["last_log"] >= _LORA_ROUTE_LOG_INTERVAL_S:
-            stats["last_log"] = now
-            try:
-                from vllm_ascend.lora.punica_npu import _LORA_PATH_STATS
-
-                op_calls = _LORA_PATH_STATS["calls"]
-                op_kernel = _LORA_PATH_STATS["kernel"]
-                op_matmul = _LORA_PATH_STATS["matmul"]
-            except Exception:
-                op_calls = op_kernel = op_matmul = -1
-            logger.info(
-                "LoRA route: calls=%d kernel=%d matmul=%d wrappers=%d "
-                "(force_kernel=%s, kernel_only=%s, max_sched_tokens=%s) "
-                "op: calls=%d kernel=%d matmul=%d",
-                stats["calls"], stats["kernel"], stats["matmul"], n_wrappers,
-                force_kernel, kernel_only,
-                int(np.max(num_scheduled_tokens)) if num_scheduled_tokens.size else 0,
-                op_calls, op_kernel, op_matmul,
             )
 
     def set_active_loras(

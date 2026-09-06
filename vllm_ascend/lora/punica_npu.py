@@ -1,144 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
-import os
-import time
 from collections.abc import Callable
 
 import torch
-from vllm.logger import init_logger
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.lora.lora_ops import _LORA_WRAPPER_IDS, _LORA_WRAPPERS, lora_linear
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
-# Kill switch for the masked-GEMM fast path; set to "0" to always use the
-# AscendC sgmv/bgmv kernels (e.g. for A/B performance comparison).
-_LORA_MATMUL_FASTPATH = os.environ.get("VLLM_ASCEND_LORA_MATMUL_FASTPATH", "1") != "0"
-
-_logger = init_logger(__name__)
-# Debug counters for the kernel/matmul split of actual LoRA linears; logged
-# periodically so the per-step routing decision can be verified at runtime.
-_LORA_PATH_STATS = {"calls": 0, "kernel": 0, "matmul": 0, "last_log": 0.0}
-_LORA_PATH_LOG_INTERVAL_S = 30.0
-
-# PunicaWrapperNPU instances registered for the lora_linear custom op. The op
-# schema only allows schema-friendly types, so the body receives the wrapper
-# id and resolves the wrapper here; this lets the op body read the per-step
-# routing flag at execution time instead of at trace time.
-_LORA_WRAPPERS: dict[int, "PunicaWrapperNPU"] = {}
-_LORA_WRAPPER_IDS = itertools.count()
-
-# Bypass-logging diagnostic: append the first N routing events of each process
-# to a file so the actual runtime dispatch can be verified even when the code
-# path runs inside ACL graph capture / compiled artifacts.
-_LORA_TRACE_PATH = os.environ.get("VLLM_ASCEND_LORA_TRACE", "")
-_LORA_TRACE_LIMIT = 40
-
-
-def _lora_trace(tag: str, extra: str = "") -> None:
-    if not _LORA_TRACE_PATH:
-        return
-    if _LORA_PATH_STATS["calls"] > _LORA_TRACE_LIMIT:
-        return
-    try:
-        with open(_LORA_TRACE_PATH, "a") as f:
-            f.write(f"{time.time():.3f} pid={os.getpid()} {tag} {extra}\n")
-    except OSError:
-        pass
-
-
-@torch.library.custom_op("_vllm_ascend_lora::lora_linear", mutates_args={"y"})
-def _lora_linear(
-    wrapper_id: int,
-    y: torch.Tensor,
-    x: torch.Tensor,
-    lora_a_stacked: list[torch.Tensor],
-    lora_b_stacked: list[torch.Tensor],
-    scale: float,
-    output_slices: list[int],
-    packed_lora_a: torch.Tensor | None,
-    packed_lora_b: torch.Tensor | None,
-    add_inputs: bool,
-) -> None:
-    """
-    Opaque entry point for one LoRA linear, dispatched through from
-    PunicaWrapperNPU.add_lora_linear.
-
-    vLLM compiles the model with torch.compile(fullgraph=True) and drops all
-    guards (evaluate_guards=False), so dynamo traces the forward exactly once
-    and never retraces: any Python-level branch in the traced code (such as
-    the kernel-vs-matmul routing flag) is constant-folded to the value it
-    held at trace time and frozen into every later execution, including
-    replayed ACL graphs. Custom ops are opaque to dynamo -- the graph only
-    records the call and the Python body executes on every invocation, so
-    the body below reads the live routing flag. ACL graph capture runs the
-    same body while the model runner forces the kernel path
-    (NPUModelRunner._route_lora_kernels with force_kernel=True), which is
-    what gets recorded into the replayed decode graphs, while prefill
-    steps execute the body with the masked-GEMM path.
-    """
-    wrapper = _LORA_WRAPPERS[wrapper_id]
-    # Route by batch type (flag maintained by the model runner, see
-    # NPUModelRunner.set_active_loras): decode-sized batches run the
-    # AscendC sgmv/bgmv vector kernels (they beat Cube-based matmul at
-    # small batch sizes: 58ms vs 67ms per decode iteration measured on
-    # qwen3.5-27B TP4), while prefill batches run the masked-GEMM fast
-    # path, which requires the single-LoRA-slot layout. NOTE: vLLM v1
-    # keeps LoRAMapping.is_prefill always True, so the batch type must
-    # be routed by the model runner instead.
-    use_kernel = (
-        not wrapper._single_lora_slot
-        or wrapper._kernel_only_small_batch
-        or not _LORA_MATMUL_FASTPATH
-    )
-    _lora_trace("op_body", f"tokens={x.shape[0]} kernel={use_kernel}")
-    stats = _LORA_PATH_STATS
-    stats["calls"] += 1
-    stats["kernel" if use_kernel else "matmul"] += 1
-    now = time.monotonic()
-    if now - stats["last_log"] >= _LORA_PATH_LOG_INTERVAL_S:
-        stats["last_log"] = now
-        _logger.info(
-            "LoRA linear path: calls=%d kernel=%d matmul=%d (flag=%s, fastpath=%s)",
-            stats["calls"],
-            stats["kernel"],
-            stats["matmul"],
-            wrapper._kernel_only_small_batch,
-            _LORA_MATMUL_FASTPATH,
-        )
-    if use_kernel:
-        wrapper._lora_linear_kernel(y, x, lora_a_stacked, lora_b_stacked, scale, output_slices)
-    else:
-        wrapper._lora_linear_matmul(
-            y,
-            x,
-            lora_a_stacked,
-            lora_b_stacked,
-            scale,
-            output_slices,
-            packed_lora_a,
-            packed_lora_b,
-            add_inputs,
-        )
-
-
-@_lora_linear.register_fake
-def _lora_linear_fake(
-    wrapper_id,
-    y,
-    x,
-    lora_a_stacked,
-    lora_b_stacked,
-    scale,
-    output_slices,
-    packed_lora_a,
-    packed_lora_b,
-    add_inputs,
-) -> None:
-    # Only mutates y in place; there are no outputs to infer.
-    return None
 
 
 # The platforms that are compatible with the PyTorch-native implementation can
@@ -516,7 +386,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # not frozen into the compiled artifact at dynamo trace time.
         # NOTE: everything in this method is traced inline by dynamo, so only
         # dynamo-safe code (op calls) may live here.
-        _lora_linear(
+        lora_linear(
             self._wrapper_id,
             y,
             x,
@@ -539,7 +409,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         output_slices: tuple[int, ...] | list[int],
     ) -> None:
         """AscendC sgmv/bgmv kernel path (decode-sized batches)."""
-        _lora_trace("kernel_path", f"tokens={x.size(0)}")
         r = lora_b_stacked[0].size(-1)
         buffer = self._get_shrink_buffer(len(output_slices), x.size(0), r, x.device)
         self.add_shrink(buffer, x, lora_a_stacked, scale)
@@ -584,7 +453,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         add_inputs: bool,
     ) -> None:
         """Masked-GEMM fast path for prefill batches (single-LoRA slot)."""
-        _lora_trace("matmul_path", f"tokens={x.size(0)}")
         x = x.view(-1, x.shape[-1])
         y = y.view(-1, y.shape[-1])
         assert self._single_lora_mask is not None
