@@ -646,6 +646,18 @@ class NPUWorker(WorkerBase):
             self.torch_allocated / GiB_bytes,
         )
 
+    def log_memory_stats(self) -> None:
+        """Profiles the torch reserved memory, torch allocated memory in execute_model()."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        self.torch_reserved = torch.npu.memory_reserved()
+        self.torch_allocated = torch.npu.memory_allocated()
+        logger.debug(
+            "torch reserved memory: %.2f GiB, torch allocated memory: %.2f GiB",
+            self.torch_reserved / GiB_bytes,
+            self.torch_allocated / GiB_bytes,
+        )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
