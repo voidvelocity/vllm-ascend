@@ -1,0 +1,34 @@
+vllm_ascend/models/glm5next/ops/fused_eh_norm.py
+  s_0589d14a581139::t_cf3d841f50f138 1-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "a12d47a07f3332a57eeb97731ca26c87bf17c4bc",
+  "prompts": {},
+  "sessions": {
+    "s_0589d14a581139": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6ac27c15f01e14af62037eef",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "voidvelocity <1225714785@qq.com>",
+      "custom_attributes": {
+        "checkpoint_content_bytes": "8138157",
+        "original_file_count": "443",
+        "session_id": "6ac27c15f01e14af62037eef",
+        "client_type": "ide",
+        "external_session_id": "6ac27c15f01e14af62037eef",
+        "display_model_name": "GLM-5.3",
+        "included_file_count": "443",
+        "tool_name": "Shell",
+        "operation_id": "6ac30c6ef01e14af62037fca",
+        "tool_use_id": "6ac30c6ef01e14af62037fca",
+        "edit_kind": "bash",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
