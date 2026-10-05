@@ -1,0 +1,14 @@
+CODE_OF_CONDUCT.md
+  h_9f58e71e47ba00 112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "c3aa0af192c8fd7433de8b6bec2fc91bf3797226",
+  "prompts": {},
+  "humans": {
+    "h_9f58e71e47ba00": {
+      "author": "voidvelocity <1225714785@qq.com>"
+    }
+  }
+}
