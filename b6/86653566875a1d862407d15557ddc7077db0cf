@@ -1,0 +1,14 @@
+tests/e2e/common/single_node/__init__.py
+  h_9f58e71e47ba00 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "b686653566875a1d862407d15557ddc7077db0cf",
+  "prompts": {},
+  "humans": {
+    "h_9f58e71e47ba00": {
+      "author": "voidvelocity <1225714785@qq.com>"
+    }
+  }
+}
